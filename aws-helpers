@@ -1,0 +1,11 @@
+import boto3
+import pickle
+import io
+import os
+
+
+def save_pkl_to_s3(obj, file_name, bucket_name=None, folder_name=None):
+    pkl_object = pickle.dumps(obj)
+    s3 = boto3.client('s3')
+    object_key = os.path.join(folder_name, file_name + '.pkl')
+    s3.put_object(Bucket=bucket_name, Key=object_key, Body=pkl_object)
