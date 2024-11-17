@@ -268,3 +268,42 @@ def plot_roc_rank(targets, estimate, df, title='', subtitle='', pdf=None, savefi
 
     return auc, ks
     
+# PDP Plot function
+
+def plot_pdps(train_df, target, bins=20, pdf=None, gbm=None, vars=[], plot_pdp=True, plot_estimate=True, dictionary=None, savefile=None, rawgraphpath=None):
+    # df should have var, target, and model as columns
+    df = train_df.copy()
+    df[vars] = df[vars].fillna(-999999)
+    if savefile:
+        filenames = []
+
+    for var in vars:
+
+        if isinstance(gbm, lgb.basic.Booster):
+            df['Model_Estimate'] = gbm.predict(df[vars].replace(-999999, np.nan))
+        else:
+            df['Model_Estimate'] = gbm.predict_proba(df[vars].replace(-999999, np.nan))[:, 1]
+        temp = df[vars].copy()
+        uniques = list(df[var].sample(200).unique())
+        uniques.sort()
+        uniques_dict = {}
+        for i in uniques:
+            temp[var] = i
+            if isinstance(gbm, lgb.basic.Booster):
+                uniques_dict[i] = gbm.predict(temp.replace(-999999, np.nan)).mean()  
+            else: 
+                uniques_dict[i] = gbm.predict_proba(temp.replace(-999999, np.nan))[:,:1].mean()
+        
+        pdp = pd.DataFrame.from_dict(uniques_dict, orient='index')
+        pdp.columns = ['values']
+        pdp['average'] = pdp.index
+        df[var] = df[var].astype(float)
+
+        if len(df[var].unique()) <= 3:
+            df['edges'] = df[var].astype(float)
+            target_rate = df[[var, target]].groupby(df[var], observed=False).mean()[target]
+            model_estimate = df[[var, 'Model_Estimate']].groupby(df[var], observed=False).mean()['Model_Estimate']
+            pdp[var] = pdp['average'].astype(float)
+            pdp = pdp[[var, 'values']].groupby(pdp[var], observed=False).mean()['values'].dropna()
+        else:
+            array = np.arange()
