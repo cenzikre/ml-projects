@@ -27,7 +27,7 @@ def drop_unimportant_variables(
     n_repeats: int=2, # number of repeats in RepeatedStratifiedKFold
     random_state: int=1,
     drop_fraction: float=0.05, # what fraction of feature importance to drop at each step (group dropping)
-    pdf: bool=None,
+    pdf=None,
     plot_title: str='',
     weighted: bool=False
     ):
@@ -101,3 +101,170 @@ def drop_unimportant_variables(
         metrics[len(importances)] = folds
 
         return importances
+
+    condition = (len(columns) > exhaustive_search_threshold)
+    while condition:
+        importances = score_folds(columns)
+        cumulative = importances.sort_values(ascending=True).cumsum().sort_values(ascending=False)
+        keeps = list(cumulative[cumulative > importances.sum()*drop_fraction].index)
+        drops = [i for i in columns if i not in keeps]
+        if len(drops) > 100:
+            drops = str(len(drops)) + ' variables'
+        columns = keeps
+        auc = pd.DataFrame(metrics[len(importances)]).T['AUC' + seg].mean()
+        auc_train = pd.DataFrame(metrics[len(importances)]).T['AUC' + ' DEV'].mean()
+        print('\nDropping:', drops, ',', len(columns), 'vars remaining, AUC:', round(auc, 4), 'training AUC:', round(auc_train, 4), end='')
+        condition = (len(columns) > exhaustive_search_threshold) and (len(drops) > 0)
+
+    print('\nIteratively drop feature that improves AUC the least. This will ensure highly correlated features are dropped first.', end='')
+    while len(columns) > 1:
+        auc_dict = {}
+        for var in columns:
+            auc_dict[var] = 0
+
+        for train_index, test_index in skf.split(df, df[target]):
+            train, test = df.iloc[train_index, :], df.iloc[test_index, :]
+            train_weights = train['DEV']['SAMPLE_WEIGHT'] if weighted else None
+            valid_weights = test['VAL']['SAMPLE_WEIGHT'] if weighted else None
+
+            # For each variable, train a new model with every variable except that one
+            for var in columns:
+                except_var = [i for i in columns if i != var]
+                gb1.fit(
+                    train[except_var],
+                    train[target],
+                    sample_weight=train_weights,
+                    eval_metric='auc',
+                    eval_set=[(test[except_var], test[target])],
+                    eval_sample_weight=[valid_weights],
+                )
+                y = gb1.predict_proba(test[except_var])[:, 1]
+                auc_dict[var] = auc_dict[var] + roc_auc_score(test[target], y)
+
+        # Drop variable that decreased AUC the least, (get max of auc_dict)
+        drop_var = max(auc_dict, key=auc_dict.get)
+        columns = [i for i in columns if i != drop_var]
+        importances = score_folds(columns)
+        auc = pd.DataFrame(metrics[len(importances)]).T['AUC' + seg].mean()
+        auc_train = pd.DataFrame(metrics[len(importances)]).T['AUC' + ' DEV'].mean()
+        print('\nDropping:', drop_var, ',', len(columns), 'vars remaining AUC:', round(auc, 4), 'training AUC:', round(auc_train, 4), end='')
+
+    print(' Final Var: ', columns[0])
+
+    # Plot fold AUCs
+    keys = list(metrics.keys())
+
+    # ax2 = ax1.twinx()
+    colors = {'VAL': 'teal', 'OOT1': 'grey', 'OOT2': 'red'}
+    for metric in ['AUC', 'KS']:
+        fig, ax1 = plt.subplots(nrow=1, ncols=1, figsize=(12, 6), facecolor='white')
+        plot_dfs = {}
+        for seg in [j for j in list(dfs.keys()) if j not in ['DEV+VAL', 'DEV']]:
+            plot_dfs[seg] = pd.DataFrame()
+            for i in keys:
+                plot_dfs[seg] = pd.concat([plot_dfs[seg], pd.DataFrame.from_dict(metrics[i], orient='index')[metric + ' ' + seg]], axis=1)
+            plot_dfs[seg].columns = keys
+            means = plot_dfs[seg].mean()
+            stds = plot_dfs[seg].std()
+
+            # Create violin plots
+            plot_data = [np.random.normal(means.iloc[i], stds.iloc[i], size=1000) for i in range(len(means))]
+            parts = ax1.violinplot(plot_data, width=.9, showmeans=False, showextrema=False, showmedians=False, points=1000)
+            color = colors[seg]
+            for pc in parts['bodies']:
+                pc.set_facecolor(color)
+                pc.set_edgecolor(color)
+                pc.set_alpha(.3)
+
+        ax1.set_ylabel(metric)
+        ax1.yaxis.set_major_locator(matplotlib.ticker.MultipleLocator(.01))
+        ax1.set_xticks([i for i in range(plot_dfs[seg].shape[1] + 1)])
+        ax1.set_xticklabels([''] + keys)
+        ax1.set_xlabel('Number of Features')
+        ax1.grid()
+
+        import matplotlib.patches as mpatches
+        teal = mpatches.Patch(color='teal', label='Validation')
+        grey = mpatches.Patch(color='grey', label='OOT1')
+        red = mpatches.Patch(color='red', label='OOT2')
+        plt.legend(handles=[teal, grey, red])
+        plt.title(plot_title + '\n' + metric + ' Confidence Interval')
+        if pdf != None:
+            pdf.savefig(fig)
+        plt.show()
+
+    var_df = pd.DataFrame([variables.keys(), variables.values()]).T
+    var_df.columns = ['num_features', 'features']
+    for seg in [j for j in list(dfs.keys()) if j not in ['DEV+VAL']]:
+        for metric in ['AUC', 'KS']:
+            var_df[seg + ' ' + metric + ' mean'] = [round(pd.DataFrame(metric[i]).T[metric + ' ' + seg].mean(), 4) for i in metrics.keys()]
+            var_df[seg + ' ' + metric + ' std'] = [round(pd.DataFrame(metric[i]).T[metric + ' ' + seg].std(), 4) for i in metrics.keys()]
+
+    warnings.resetwarnings()
+    pd.options.mode.chained_assignment = 'warn'
+
+    return var_df
+
+# Plot ROC & KS plot
+
+def plot_roc_rank(targets, estimate, df, title='', subtitle='', pdf=None, savefig=None):
+    import sklearn.metrics as metrics
+    from sklearn.metrics import roc_auc_score
+    from scipy.stats import ks_2samp
+
+    # Plot validation ROC
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 4))
+    ax1.set_title(subtitle + ' ROC Curve')
+    for target in targets:
+        val = df.dropna(subset=[target, estimate])
+        preds = val[estimate]
+        y_test = val[target]
+        fpr, tpr, threshold = metrics.roc_curve(y_test, preds)
+        auc = metrics.auc(fpr, tpr)
+        ks = round(ks_2samp(val.loc[val[target]==0, estimate], val.loc[val[target]==1, estimate])[0], 4)
+        label = target + +' AUC = %0.3f' % auc + '\n' + target + ' KS = %0.3f' % ks
+        if target == targets[-1]:
+            label = label + '\nLoans: ' + str(len(val))
+        ax1.plot(fpr, tpr, label=label)
+    ax1.legend(loc='lower right')
+    ax1.plot([0, 1], [0, 1], 'k--', alpha=.3)
+    ax1.set_xlim([-.02, 1.02])
+    ax1.set_ylim([-.02, 1.02])
+    ax1.set_ylabel('True Positive Rate')
+    ax1.set_xlabel('False Positive Rate')
+    ax1.grid(True)
+
+    # Plot rank order
+    edges = [val[estimate].quantiles((1+1)/10) for i in range(10)]
+    val['bin'] = 0
+    for i in range(len(edges)):
+        val.loc[val[estimate] > edges[i], 'bin'] = i + 1
+    val['bin'] = val['bin'] + 1
+    labels = list(val.bin.unique())
+    labels.sort()
+    bins = np.arange(1, len(labels) + 0.5, 1)
+    for target in targets:
+        bads = val[['bin', target]].groupby(val['bin']).mean()[target]
+        ax2.plot(bins, bads, label=target + ' Rate')
+    estimates = val[['bin', estimate]].groupby(val['bin']).mean()[estimate]
+
+    ax2.plot(bins, estimates, label='Model Average Estimate', color='grey')
+    ax2.set_ylabel('Bad Rate')
+    ax2.set_xlabel('Model Score Decile')
+    ax2.set_xticks(bins)
+    ax2.set_xticklabels(labels=labels)
+    ax2.set_title(subtitle + ' Rank Order')
+    ax2.set_ylim([-.02, 1.02])
+    ax2.legend()
+    ax2.grid(True)
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.88)
+
+    if pdf is not None:
+        pdf.savefig(fig)
+    if savefig:
+        fig.savefig(f'{rawgraphpath}\{savefile}')
+    ptl.show()
+
+    return auc, ks
+    
