@@ -306,4 +306,116 @@ def plot_pdps(train_df, target, bins=20, pdf=None, gbm=None, vars=[], plot_pdp=T
             pdp[var] = pdp['average'].astype(float)
             pdp = pdp[[var, 'values']].groupby(pdp[var], observed=False).mean()['values'].dropna()
         else:
-            array = np.arange()
+            array = np.arange(0, 1, 1/bins)
+            edges = list(set(df[var].quantile(array, interpolation='nearest')))
+            edges.sort()
+            edges = edges + [df[var].max() + 1]
+            df['edges'] = pd.cut(df[var], bins=edges, include_lowest=True, right=False, retbins=False)
+            pdp['edges'] = pd.cut(pdp['average'], bins=edges, include_lowest=True, right=False, retbins=False)
+            target_rate = df[['edges', target]].groupby('edges', observed=False).mean()[target]
+            model_estimate = df[['edges', 'Model_Estimate']].groupby('edges', observed=False).mean()['Model_Estimate']
+            pdp = pdp[['edges', 'values']].groupby('edges', observed=False).mean()['values'].dropna()
+        
+        fig, ax1 = plt.subplots(figsize=(10, 6))
+        ax2 = ax1.twinx()
+        ax2.bar([str(i) for i in target_rate.index.values], df['edges'].value_counts()[target_rate.index.values], color='grey', alpha=.2)
+        ax1.plot([str(i) for i in target_rate.index.values], target_rate, label=target + ' Rate')
+
+        if plot_estimate:
+            ax1.plot([str(i) for i in target_rate.index.values], model_estimate, label='Average Model Estimate')
+
+        if plot_pdp:
+            ax1.plot([str(i) for i in pdp.index.values], pdp, label='Variable Partial Dependence')
+
+        ax1.set_xticklabels(labels=[str(i) for i in target_rate.index.values], rotation=90)
+        ax1.set_ylabel(target + ' Rate')
+        ax1.grid(axis='y')
+        ax2.set_ylabel('Counts')
+        ax1.legend()
+        ymax = max(round(max(target_rate), 2), round(max(model_estimate), 2)) + 0.1
+        ax1.set_ylim(bottom=0.0, top=ymax)
+        try:
+            title = var + ' : ' + dictionary.loc[dictionary['variable']==var].Description.values[0]
+            title = title[:100] + '\n' + title[100:200] + '\n' + title[200:300]
+        except:
+            title = var
+        plt.title(title)
+        plt.show()
+
+        if savefig:
+            figname = f'{var}.png'
+            filenames.append(figname)
+            fig.tight_layout()
+            path = os.path.join(rawgraphpath, figname)
+            fig.savefig(path)
+    
+    if savefile:
+        return filenames
+
+def plot_pdps_var(train_df, target: str, model_info: tuple, var: str, bins=20, plot_pdp=True, plot_estimate=True, dictionary=None):
+    df = train_df.copy()
+    gbm, model_features = model_info
+    df[model_features] = df[model_features].fillna(-999999)
+
+    if isinstance(gbm, lgb.basic.Booster):
+        df['Model_Estimate'] = gbm.predict(df[model_features].replace(-999999, np.nan))
+    else:
+        df['Model_Estimate'] = gbm.predict_proba(df[model_features].replace(-999999, np.nan))[:, 1]
+    temp = df[model_features]
+    uniques = list(df[var].sample(200).unique())
+    uniques.sort()
+    uniques_dict = {}
+    for i in uniques:
+        temp[var] = i
+        if isinstance(gbm, lgb.basic.Booster):
+            uniques_dict[i] = gbm.predict(temp.replace(-999999, np.nan)).mean()  
+        else: 
+            uniques_dict[i] = gbm.predict_proba(temp.replace(-999999, np.nan))[:,:1].mean()
+    
+    pdp = pd.DataFrame.from_dict(uniques_dict, orient='index')
+    pdp.columns = ['values']
+    pdp['average'] = pdp.index
+    df[var] = df[var].astype(float)
+
+    if len(df[var].unique()) == 2:
+        df['edges'] = df[var].astype(float)
+        target_rate = df[[var, target]].groupby(df[var], observed=False).mean()[target]
+        model_estimate = df[[var, 'Model_Estimate']].groupby(df[var], observed=False).mean()['Model_Estimate']
+        pdp[var] = pdp['average'].astype(float)
+        pdp = pdp[[var, 'values']].groupby(pdp[var], observed=False).mean()['values'].dropna()
+    else:
+        array = np.arange(0, 1, 1/bins)
+        edges = list(set(df[var].quantile(array, interpolation='nearest')))
+        edges.sort()
+        edges = edges + [df[var].max() + 1]
+        df['edges'] = pd.cut(df[var], bins=edges, include_lowest=True, right=False, retbins=False)
+        pdp['edges'] = pd.cut(pdp['average'], bins=edges, include_lowest=True, right=False, retbins=False)
+        target_rate = df[['edges', target]].groupby('edges', observed=False).mean()[target]
+        model_estimate = df[['edges', 'Model_Estimate']].groupby('edges', observed=False).mean()['Model_Estimate']
+        pdp = pdp[['edges', 'values']].groupby('edges', observed=False).mean()['values'].dropna()
+
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+    ax2 = ax1.twinx()
+    ax2.bar([str(i) for i in target_rate.index.values], df['edges'].value_counts()[target_rate.index.values], color='grey', alpha=.2)
+    ax1.plot([str(i) for i in target_rate.index.values], target_rate, label=target + ' Rate')
+
+    if plot_estimate:
+        ax1.plot([str(i) for i in target_rate.index.values], model_estimate, label='Average Model Estimate')
+
+    if plot_pdp:
+        ax1.plot([str(i) for i in pdp.index.values], pdp, label='Variable Partial Dependence')
+
+    ax1.set_xticklabels(labels=[str(i) for i in target_rate.index.values], rotation=90)
+    ax1.set_ylabel(target + ' Rate')
+    ax1.grid(axis='y')
+    ax2.set_ylabel('Counts')
+    ax1.legend()
+    ymax = max(round(max(target_rate), 2), round(max(model_estimate), 2)) + 0.1
+    ax1.set_ylim(bottom=0.0, top=ymax)
+    try:
+        title = var + ' : ' + dictionary.loc[dictionary['variable']==var].Description.values[0]
+        title = title[:100] + '\n' + title[100:200] + '\n' + title[200:300]
+    except:
+        title = var
+    plt.title(title)
+    plt.show()
