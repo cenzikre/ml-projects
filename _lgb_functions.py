@@ -7,6 +7,8 @@ import lightgbm as lgb
 from lightgbm import LGBClassifier
 from collections import defaultdict
 from scipy.stats import ks_2samp
+from scipy.signal import find_peaks
+from scipy.stats import gaussian_kde
 from sklearn.model_selection import train_test_split
 from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.model_selection import train_test_split
@@ -419,3 +421,169 @@ def plot_pdps_var(train_df, target: str, model_info: tuple, var: str, bins=20, p
         title = var
     plt.title(title)
     plt.show()
+
+def plot_auc_vs_time(df, model_estimate, target, pdf=None, target2=None, date='OpenDate', title='', savefig=None):
+    fig, axes = plt.subplots(nrow=1, ncols=1, figsize=(8, 4))
+    color1 = '#c4d600'
+    color2 = '#777777'
+    df['MONTH_BIN'] = [str(i)[:7] for i in df[date].astype(str)]
+    month_bins = list(df['MONTH_BIN'].unique())
+    month_bins.sort()
+    if len(month_bins) > 0:
+        if target2 is None:
+            cols = ['Not' + target, target, 'AUC', 'Funded']
+        else:
+            cols = ['Not' + target, target, target2, 'AUC', 'Funded']
+        auc_df = pd.DataFrame(index=month_bins, columns=cols)
+
+        for i in month_bins:
+            devscored_val = df.loc[~(df[target].isna())]
+            devscored_val = devscored_val.loc[devscored_val['MONTH_BIN']==i]
+            auc_df[target][i] = int(devscored_val[target].sum())
+            if target2 is not None:
+                auc_df[target2][i] = int(devscored_val[target2].sum())
+            auc_df['Funded'][i] = len(devscored_val)
+            auc_df['Not' + target][i] = len(devscored_val) - int(devscored_val[target].sum())
+            if len(devscored_val) > 50:
+                auc_df['AUC'][i] = roc_auc_score(devscored_val[target], devscored_val[model_estimate])
+
+        axes.set_title('Funded Loans and ' + target + ' Rate')
+        auc_df = auc_df.loc[auc_df['Funded'] > 0]
+        auc_df['Rate'] = auc_df[target] / auc_df['Funded']
+        ax2 = axes.twinx()
+        ax2.set_ylim([0, 1])
+        auc_df.dropna(how='any')['Rate'].plot(ax=ax2, linestyle='-', marker='o', label=target + ' Rate')
+        auc_df.dropna(how='any')['AUC'].plot(ax=ax2, linestyle='-', marker='o', color='red', label=title + 'AUC')
+        auc_df.dropna(how-'any')[[target, 'Not ' + target]].plot.bar(rot=0, ax=axes, stacked=True, color=[color1, color2])
+
+        axes.set_xticklabels(labels=auc_df.dropna(how='any').index, rotation=90)
+        ax2.set_ylim([0, 1])
+        axes.set_xlabel('Booked Month')
+        axes.set_ylabel('Number of Accounts Booked')
+        ax2.legend(loc='lower right')
+        axes.legend(loc='upper left')
+
+    ax2.set_yticks(np.arange(0, 1., .1), minor=True)
+    ax2.grid(which='both')
+    fig.tight_layout()
+    plt.show()
+
+    if not isinstance(pdf, type(None)):
+        pdf.savefig(fig)
+
+    if savefig:
+        fig.savefig(rf'{rawgraphpath}\{savefig}')
+
+def dist_plot(ser):
+    val_max, val_min = ser.max(), ser.min()
+    val_len = max(val_max - val_min, 20)
+
+    # Compute KDE
+    kde = gaussian_kde(ser)
+    x = np.linspace(val_min - val_len // 2, val_max + val_len // 2, 1000)
+    y = kde.evaluate(x)
+
+    # Find peaks
+    peaks, _ = find_peaks(y)
+    peaks_loc = x[peaks]
+
+    # Print the x-values of the peaks
+    print("X-values of the peaks: ", peaks_loc)
+
+    # Plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(x, y, label='KDE')
+    plt.scatter(peaks_loc, y[peaks], color='red', marker='o', label='Peaks')
+    plt.legend()
+    plt.title(f'{ser.name}')
+    plt.show()
+
+def calc_weights(x, y, default=1e-6):
+    kde_x, kde_y = gaussian_kde(x), gaussian_kde(y)
+    dx, dy = kde_x(x), kde_y(y)
+    return dy / dx
+
+class BackwardSelector():
+    def __init__(self, target, columns, parameters, data, model=None, n_splits=4, n_repeats=2, random_state=1, na_fill=-999999):
+        self.target = target
+        self.columns = columns
+        self.parameters = parameters
+        self.model = LGBClassifier(**parameters) if model is None else model(**parameters)
+        self.skf = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=random_state)
+        self.dfs = {'DEV + VAL': data.loc[data[target].notna()].reset_index(drop=True), 'DEV': None, 'VAL': None}
+        self.na_fill = na_fill
+        self.variables, self.metrics = {}, {}
+
+    def score_folds(self, columns: list):
+        folds = {}
+        importances = pd.Series(0, index=columns)
+        df = self.dfs['DEV + VAL']
+
+        for train_index, test_index in self.skf.split(df, df[self.target]):
+            self.dfs['DEV'], self.dfs['VAL'] = df.iloc[train_index, :], df.iloc[test_index, :]
+            self.model.fit(
+                self.dfs['DEV'][columns].fillna(self.na_fill),
+                self.dfs['DEV'][self.target],
+                eval_metric='auc',
+                eval_set=[(self.dfs['VAL'][columns].fillna(self.na_fill), self.dfs['VAL'][self.target])]
+            )
+
+            fold = {}
+            for i in self.dfs.keys():
+                y = self.model.predict_proba(self.dfs[i][columns].fillna(self.na_fill))[:, 1]
+                fold['AUC ' + i] = roc_auc_score(self.dfs[i][self.target], y)
+                fold['KS ' + i] = ks_2samp(y[self.dfs[i][self.target]==0], y[self.dfs[i][self.target]==1])[0]
+
+            folds[len(folds)] = fold
+            importances = importances + pd.Series(self.model.feature_importances_, columns)
+
+        self.variables[len(importances)] = columns
+        self.metrics[len(importances)] = folds
+
+        return importances
+
+    def batchdrop(self, drop_fraction=0.05):
+        importances = self.score_folds(self.columns)
+        cumulative = importances.sort_values(ascending=True).cumsum().sort_values(ascending=False)
+        keeps = list(cumulative[cumulative > importances.sum() * drop_fraction].index)
+        self.drops = [x for x in self.columns if x not in keeps]
+        self.columns = keeps
+
+    def exhaustivesearch(self):
+        auc_dict = defaultdict(float)
+        df = self.dfs['DEV + VAL']
+
+        for train_index, test_index in self.skf.split(df, df[self.target]):
+            train, test = df.iloc[train_index, :], df.iloc[test_index, :]
+
+            for var in self.columns:
+                except_var = [i for i in self.columns if i != var]
+                self.model.fit(
+                    train[except_var].fillna(self.na_fill),
+                    train[self.target],
+                    eval_metric='auc',
+                    eval_set=[(test[except_var].fillna(self.na_fill), test[self.target])]
+                )
+                y = self.model.predict_proba(test[except_var].fillna(self.na_fill))[:, 1]
+                auc_dict[var] += roc_auc_score(test[self.target], y)
+
+        drop_var = max(auc_dict, key=auc_dict.get)
+        self.columns = [i for i in self.columns if i != drop_var]
+        importances = self.score_folds(self.columns)
+
+    def fit(self, exhaustive_search_threshold=30, drop_fraction=0.05):
+        condition = (len(self.columns) > exhaustive_search_threshold)
+        while condition:
+            self.batchdrop(drop_fraction=drop_fraction)
+            condition = (len(self.columns) > exhaustive_search_threshold) and (len(self.drops > 0))
+
+        while len(self.columns) > 1:
+            self.exhaustivesearch()
+
+        self.var_df = pd.DataFrame([self.variables.keys(), slef.variables.values()]).T
+        self.var_df.columns = ['num_features', 'features']
+
+        for seg in [j for j in list(self.dfs.keys()) if j not in ['DEV + VAL']]:
+            for metric in ['AUC', 'KS']:
+                self.var_df[seg + ' ' + metric + ' mean'] = [round(pd.DataFrame(self.metrics[i]).T[metric + ' ' + seg].mean(), 4) for i in self.metrics.keys()]
+                self.var_df[seg + ' ' + metric + ' std'] = [round(pd.DataFrame(self.metrics[i]).T[metric + ' ' + seg].std(), 4) for i in self.metrics.keys()]
