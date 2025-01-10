@@ -7,7 +7,7 @@ import lightgbm as lgb
 from lightgbm import LGBClassifier
 from collections import defaultdict
 from scipy.stats import ks_2samp
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, butter, filtfilt
 from scipy.stats import gaussian_kde
 from sklearn.model_selection import train_test_split
 from sklearn.model_selection import RepeatedStratifiedKFold
@@ -587,3 +587,44 @@ class BackwardSelector():
             for metric in ['AUC', 'KS']:
                 self.var_df[seg + ' ' + metric + ' mean'] = [round(pd.DataFrame(self.metrics[i]).T[metric + ' ' + seg].mean(), 4) for i in self.metrics.keys()]
                 self.var_df[seg + ' ' + metric + ' std'] = [round(pd.DataFrame(self.metrics[i]).T[metric + ' ' + seg].std(), 4) for i in self.metrics.keys()]
+
+
+def butter_lowpass(cutoff, fs, order=5):
+    nyquist = 0.5 * fs
+    normal_cutoff = cutoff / nyquist
+    b, a = butter(order, noraml_cutoff, btype='low', analog=False)
+    return b, a
+
+def lowpass_filter(data, cutoff, fs, order=5, *args, **kewargs):
+    b, a = butter_lowpass(cutoff, fs, order=order)
+    y = filtfilt(b, a, data)
+    return y
+
+def direct_substract(auc, of_dist, *args, **kwargs):
+    return auc - of_dist
+
+def func(auc, of_dist, dist_func, smooth_func=None, *args, **kwargs):
+    dist = dist_func(auc, of_dist, *args, **kwargs)
+    return dist if smooth_func is None else smooth_func(dist, *args, **kwargs)
+
+def get_selected_features(selector, min_features=10, max_features=30, *args, **kwargs):
+    if isinstance(selector, pd.DataFrame):
+        summ = selector
+    elif isinstance(selector, BackwardSelector):
+        summ = selector.var_df
+    else:
+        summ = selector.var_df
+
+    if summ.shape[0] < 7:
+        return 'selection failed'
+
+    summ = summ[summ['num_features'] <= 40].set_index('num_features').sort_index()
+    summ['ABS DIFF'] = summ['DEV AUC mean'] - summ['VAL AUC mean']
+    summ['PCT DIFF'] = 1 - summ['VAL AUC mean'] / summ['DEV AUC mean']
+    summ['PSI DIFF'] = (summ['DEV AUC mean'] - summ['VAL AUC mean']) * np.log(summ['DEV AUC mean'] / summ['VAL AUC mean'])
+    summ['OF DIST'] = np.abs(summ['DEV AUC mean'] - summ['VAL AUC mean']) / np.sqrt(2)
+    summ['ADJ AUC'] = func(summ['VAL AUC mean'], summ['OF DIST'], dist_func=direct_substract, smooth_func=lowpass_filter, cutoff=0.1, fs=1.0, order=1)
+    min_features = min(min_features, summ.shape[0])
+    max_features = max(max_features, summ.shape[0])
+
+    return summ.loc[summ.loc[(min_features - 1):max_features, 'ADJ AUC'].idxmax(), 'features']
